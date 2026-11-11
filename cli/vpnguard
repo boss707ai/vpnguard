@@ -1,0 +1,229 @@
+#!/bin/bash
+# vpnguard — управление защитой от утечки трафика мимо VPN.
+#   status | on | pause [срок] | off | test | log [N] | sync | update [каталог] | uninstall
+# pause/off/update/uninstall — только root: перезапуск через `sudo -k` (пароль спрашивается всегда,
+# кэш sudo не используется и не продлевается). status/on/test/log/sync — без пароля.
+# Всё, что зависит от VPN-клиента, — в адаптере "$BASE/provider.sh" (providers/ИМЯ/provider.sh).
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+set -u
+BASE="/Library/Application Support/VPNGuard"
+SELF="$BASE/vpnguard"
+. "$BASE/state.sh"
+. "$BASE/provider.sh"
+T="${VG_PROVIDER_TITLE:-VPN-клиент}"
+STATE="$BASE/state"; STATUS="$BASE/status"; REQ="$BASE/request"
+LOG=/Library/Logs/VPNGuard.log
+LABEL=local.vpnguard
+MAX_UTUN=63   # последний utun в pf/vpnguard.rules
+
+die() { echo "vpnguard: $*" >&2; exit 1; }
+usage() {
+  cat <<'EOF'
+vpnguard — защита от утечки трафика мимо VPN
+  vpnguard status            состояние (по умолчанию)
+  vpnguard on                включить (без пароля)
+  vpnguard pause [срок]      пауза, по умолчанию 15m; срок: 5 (минуты), 30m, 1h, 90s — от 1 мин до 24 ч (пароль)
+  vpnguard off               выключить до «on» или перезагрузки (пароль)
+  vpnguard test              самотест: IP через туннель, прямой выход закрыт
+  vpnguard log [N]           последние N строк журнала (30)
+  vpnguard sync              взять адреса серверов и DNS из настроек VPN-клиента сейчас (иконка делает это сама)
+  vpnguard update [каталог]  обновить из исходников (по умолчанию ~/Tools/vpnguard): покажет изменения, спросит (пароль)
+  vpnguard uninstall         удалить полностью (пароль)
+EOF
+}
+st() { sed -n "s/^$1=//p" "$STATUS" 2>/dev/null | head -1; }
+who_did() { if [ -n "${SUDO_USER:-}" ]; then echo "$SUDO_USER"; else echo "root, окно пароля"; fi; }
+audit() { printf '%s команда: %s (%s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$(who_did)" >> "$LOG"; }
+set_state() { # mode until — только root
+  local tmp="$STATE.tmp.$$"
+  vg_state_render "$1" "$2" "$(vg_boot_id)" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$STATE"
+  launchctl kill SIGUSR1 "system/$LABEL" >/dev/null 2>&1
+}
+wait_mode() { # ждём, пока сторож применит режим (до 5 с)
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    if [ "$(st mode)" = "$1" ]; then
+      if [ "$1" = on ]; then [ "$(st rules)" = loaded ] && return 0; else [ "$(st rules)" = absent ] && return 0; fi
+    fi
+  done
+  die "сторож не подтвердил режим «$1» за 5 с — проверь: vpnguard status"
+}
+default_iface() { vg_default_iface "$(route -n get default 2>/dev/null)"; }
+
+cmd_status() {
+  local now mode until rules hook pf beat repairs lr iface vpn servers dns client ru ru_src variant n t txt rc=0
+  [ -f "$STATUS" ] || die "нет $STATUS — сторож не запущен (sudo launchctl print system/$LABEL)"
+  now=$(date +%s)
+  mode=$(st mode); until=$(st until); rules=$(st rules); hook=$(st hook); pf=$(st pf)
+  beat=$(st heartbeat); repairs=$(st repairs); lr=$(st last_repair)
+  servers=$(st servers); dns=$(st dns); client=$(st client); ru=$(st ru); ru_src=$(st ru_src); variant=$(st variant)
+  iface=$(default_iface)
+  if vg_is_tunnel "$iface"; then vpn="VPN работает ($iface)"; else vpn="VPN выключен (маршрут через ${iface:-нет})"; fi
+  case $mode in
+    on)     if vg_is_tunnel "$iface"; then echo "Защита: ВКЛЮЧЕНА · $vpn"; else echo "Защита: ВКЛЮЧЕНА · $vpn → интернет закрыт"; fi ;;
+    paused) echo "Защита: ПАУЗА до $(date -r "$until" '+%H:%M') (осталось $(vg_fmt_left $((until - now)))) · $vpn" ;;
+    off)    echo "Защита: ВЫКЛЮЧЕНА (до «vpnguard on» или перезагрузки) · $vpn" ;;
+    *)      echo "Защита: неизвестный режим «${mode}»"; rc=2 ;;
+  esac
+  printf 'Правила: %s · pf: %s · починок с запуска сторожа: %s' "$rules" "$pf" "${repairs:-0}"
+  if [ -n "$lr" ] && [ "$lr" != 0 ]; then printf ' (последняя в %s)' "$(date -r "$lr" '+%H:%M:%S')"; fi
+  echo
+  echo "VPN-серверы (из $T): ${servers:-нет}"
+  echo "DNS $T: ${dns:-нет} · российских сетей в списке: ${ru:-0}"
+  if (( now - ${beat:-0} > 30 )); then echo "ВНИМАНИЕ: сторож не отвечает $((now - ${beat:-0})) с"; rc=2; fi
+  if [ "$pf" = hung ]; then
+    echo "ВНИМАНИЕ: pf не отвечает — похоже, зависло ядро. Сохрани работу и перезагрузи Mac."; rc=2
+  elif [ "$mode" = on ] && { [ "$rules" != loaded ] || [ "$pf" != Enabled ] || [ "$hook" != present ]; }; then
+    echo "ВНИМАНИЕ: защита включена, но правила не действуют (rules=$rules, pf=$pf, anchor com.apple/*: $hook)"; rc=2
+  fi
+  if [ "$mode" = on ] && [ -z "$servers" ]; then echo "ВНИМАНИЕ: нет ни одного VPN-сервера из $T — $T не подключится. Выполни: vpnguard sync"; rc=2; fi
+  case $client in
+    ok|start|"") ;;
+    none)   echo "Адресов из $T сторож ещё не получал — выполни: vpnguard sync" ;;
+    denied) echo "ВНИМАНИЕ: macOS не даёт VPN Guard читать настройки $T — новые серверы не подхватятся (памятка, или: vpnguard sync)" ;;
+    foreign) echo "ВНИМАНИЕ: файл $REQ/client не от тебя (владелец или права не те) — сторож его не берёт. Удали его и выполни: vpnguard sync" ;;
+    *)      echo "ВНИМАНИЕ: в настройках $T не нашлось серверов ($client) — держу прежние адреса" ;;
+  esac
+  [ "$ru_src" = changed ] && echo "ВНИМАНИЕ: $T обновил список российских IP — обнови список защиты (памятка)"
+  if [ "$mode" = on ]; then
+    case $variant in
+      full|"") ;;
+      noclient)  echo "ВНИМАНИЕ: pf не принял адреса из $T — загружены правила без них ($T не подключится). Журнал: vpnguard log"; rc=2 ;;
+      noru)      echo "ВНИМАНИЕ: список российских сетей не загрузился — российские сайты напрямую не откроются. Поставь заново: sudo ~/Tools/vpnguard/install.sh"; rc=2 ;;
+      *)         echo "ВНИМАНИЕ: правила защиты повреждены — работает аварийный набор (только туннель и локалка). Поставь заново: sudo ~/Tools/vpnguard/install.sh"; rc=2 ;;
+    esac
+    if [ "${ru:-0}" = 0 ]; then echo "ВНИМАНИЕ: список российских сетей пуст — российские сайты напрямую не откроются. Поставь заново: sudo ~/Tools/vpnguard/install.sh"; rc=2; fi
+  fi
+  if [ -s "$BASE/events" ]; then
+    echo "Последние уведомления:"
+    tail -n 5 "$BASE/events" | while IFS=$'\t' read -r n t txt; do
+      [[ $t =~ ^[0-9]+$ ]] && printf '  %s  %s\n' "$(date -r "$t" '+%d.%m %H:%M')" "$txt"
+    done
+  fi
+  return $rc
+}
+
+client_handoff() { # содержимое → request/client; если ничего не поменялось (кроме штампа) — не трогаем
+  local f="$REQ/client" tmp
+  # на месте файла каталог — mv положил бы временный файл внутрь, и они копились бы каждые 10 с
+  if [ -d "$f" ] && [ ! -L "$f" ]; then die "$f — каталог, а должен быть файл: удали его и повтори"; fi
+  if [ -f "$f" ] && [ ! -L "$f" ] && [ "$(head -c 262144 "$f" | grep -v '^# vpnguard sync')" = "$(printf '%s\n' "$1" | grep -v '^# vpnguard sync')" ]; then
+    return 0
+  fi
+  tmp=$(mktemp "$REQ/.client.XXXXXX") || die "не смог писать в $REQ"
+  if ! { printf '%s\n' "$1" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$f"; }; then
+    rm -f "$tmp"; die "не смог заменить $f (чужой файл? удали его и повтори)"
+  fi
+}
+
+cmd_sync() { # адреса из настроек VPN-клиента → сторожу. Данные клиента macOS охраняет — читает пользователь
+  local quiet=${1:-} out code parsed
+  [ "$(id -u)" != 0 ] || die "запускай от своего пользователя, без sudo"
+  if ! out=$(vg_provider_extract); then
+    code=$(printf '%s\n' "$out" | sed -n 's/^error \([a-z]*\).*/\1/p' | head -1)
+    client_handoff "# error: ${code:-unreadable}"
+    out=$(printf '%s\n' "$out" | sed -n 's/^error [a-z]* *//p' | head -1)
+    die "${out:-не прочитал настройки $T}"
+  fi
+  client_handoff "# vpnguard sync · $(date '+%Y-%m-%d %H:%M:%S')
+$out"
+  [ "$quiet" = -q ] && return 0
+  parsed=$(printf '%s\n' "$out" | vg_parse_extract)
+  echo "Передал сторожу из $T: серверов $(printf '%s\n' "$parsed" | grep -c '^server '), DNS $(printf '%s\n' "$parsed" | grep -c '^dns ')."
+  if printf '%s\n' "$parsed" | grep -q '^bad '; then echo "Пропустил странные адреса: $(printf '%s\n' "$parsed" | sed -n 's/^bad //p' | head -5 | paste -sd' ' -)"; fi
+  if printf '%s\n' "$parsed" | grep -q '^dnsname '; then echo "DNS по имени защита не берёт (только адресом): $(printf '%s\n' "$parsed" | sed -n 's/^dnsname //p' | paste -sd' ' -)"; fi
+}
+
+cmd_on() {
+  if [ "$(id -u)" = 0 ]; then
+    set_state on 0; audit "on"
+  else
+    [ -e "$REQ/on" ] || : > "$REQ/on" || die "не смог записать запрос в $REQ"
+  fi
+  wait_mode on && echo "Защита включена."
+}
+
+cmd_pause() {
+  local arg=$1 secs until
+  secs=$(vg_parse_duration "$arg") || die "срок: 5 (минуты), 30m, 1h, 90s — от 1 мин до 24 ч. Пример: vpnguard pause 30m"
+  [ "$(id -u)" = 0 ] || exec sudo -k "$SELF" pause "$arg"
+  until=$(( $(date +%s) + secs ))
+  set_state paused "$until"; audit "pause $arg (до $(date -r "$until" '+%H:%M'))"
+  wait_mode paused && echo "Пауза до $(date -r "$until" '+%H:%M'). Потом защита включится сама."
+}
+
+cmd_off() {
+  [ "$(id -u)" = 0 ] || exec sudo -k "$SELF" off
+  set_state off 0; audit "off"
+  wait_mode off && echo "Защита выключена до «vpnguard on» или перезагрузки."
+}
+
+cmd_update() { # через root-копию установщика: она покажет diff и спросит подтверждение
+  local src=${1:-$HOME/Tools/vpnguard}
+  [ -d "$src" ] || die "нет каталога $src"
+  src=$(cd "$src" && pwd)
+  if [ "$(id -u)" = 0 ]; then exec "$BASE/install.sh" "$src"; fi
+  exec sudo -k "$BASE/install.sh" "$src"
+}
+
+cmd_uninstall() {
+  if [ "$(id -u)" = 0 ]; then exec "$BASE/uninstall.sh"; fi
+  exec sudo -k "$BASE/uninstall.sh"
+}
+
+cmd_test() {
+  local mode iface out ip cc org ifc a rc=0
+  mode=$(st mode); iface=$(default_iface)
+  echo "Режим защиты: ${mode:-?} · маршрут по умолчанию: ${iface:-нет}"
+  if [[ $iface =~ ^utun([0-9]+)$ ]] && (( ${BASH_REMATCH[1]} > MAX_UTUN )); then
+    echo "ВНИМАНИЕ: туннель $iface вне списка правил (utun0…utun$MAX_UTUN) — его трафик режется"; rc=2
+  fi
+  if vg_is_tunnel "$iface"; then
+    out=$(curl -sS --max-time 8 https://ipinfo.io/json 2>&1)
+    ip=$(printf '%s\n' "$out" | sed -n 's/.*"ip": *"\([^"]*\)".*/\1/p')
+    cc=$(printf '%s\n' "$out" | sed -n 's/.*"country": *"\([^"]*\)".*/\1/p')
+    org=$(printf '%s\n' "$out" | sed -n 's/.*"org": *"\([^"]*\)".*/\1/p')
+    if [ -n "$ip" ]; then echo "Через туннель: $ip ${cc} ${org}"; else echo "Через туннель: нет ответа (${out:0:80})"; rc=1; fi
+  else
+    echo "VPN выключен — проверку туннеля пропускаю"
+  fi
+  # ipinfo.io — не российский адрес и не DNS клиента: напрямую он должен быть закрыт
+  for ifc in $(ifconfig -l); do
+    [[ $ifc =~ ^en[0-9]+$ ]] || continue
+    a=$(ipconfig getifaddr "$ifc" 2>/dev/null); [ -n "$a" ] || continue
+    if curl -sS --max-time 4 --interface "$ifc" -o /dev/null https://ipinfo.io/ip 2>/dev/null; then
+      if [ "$mode" = on ]; then echo "УТЕЧКА: прямой выход через $ifc ОТКРЫТ при включённой защите!"; rc=2
+      else echo "Прямой выход через $ifc открыт (защита: $mode — так и должно быть)"; fi
+    else
+      if [ "$mode" = on ]; then echo "Прямой выход через $ifc закрыт — ок"
+      else echo "Прямой выход через $ifc закрыт (для режима $mode неожиданно)"; fi
+    fi
+  done
+  # локальный прокси клиента «всё напрямую» (у Karing — 127.0.0.1:3065): через него не должно уходить мимо туннеля
+  local px=${VG_PROVIDER_PROXY_DIRECT:-}
+  if [ "$mode" = on ] && [ -n "$px" ] && nc -z -G 2 "${px%:*}" "${px##*:}" >/dev/null 2>&1; then
+    if curl -sS --max-time 6 -x "socks5h://$px" -o /dev/null https://ipinfo.io/ip 2>/dev/null; then
+      echo "УТЕЧКА: через прокси $T $px зарубежный адрес открыт напрямую!"; rc=2
+    else
+      echo "Через прокси $T «напрямую» зарубежные адреса закрыты — ок"
+    fi
+  fi
+  return $rc
+}
+
+cmd_log() { tail -n "$1" "$LOG"; }
+
+case "${1:-status}" in
+  status)    cmd_status ;;
+  on)        cmd_on ;;
+  pause)     cmd_pause "${2:-15m}" ;;
+  off)       cmd_off ;;
+  test)      cmd_test ;;
+  log)       [[ ${2:-30} =~ ^[0-9]+$ ]] || die "log N — число строк"; cmd_log "${2:-30}" ;;
+  sync|karing) cmd_sync "${2:-}" ;;   # karing — прежнее имя команды
+  update)    cmd_update "${2:-}" ;;
+  uninstall) cmd_uninstall ;;
+  -h|--help|help) usage ;;
+  *)         usage; exit 1 ;;
+esac

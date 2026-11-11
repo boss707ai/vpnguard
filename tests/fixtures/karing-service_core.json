@@ -1,0 +1,141 @@
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "srv8443",
+      "server": "198.51.100.10",
+      "server_port": 8443
+    },
+    {
+      "type": "vless",
+      "tag": "srv10443",
+      "server": "vpn.example.net",
+      "server_port": 10443
+    },
+    {
+      "type": "vless",
+      "tag": "srv8443",
+      "server": "vpn.example.net",
+      "server_port": 8443
+    },
+    {
+      "type": "vless",
+      "tag": "srv8443",
+      "server": "vpn.example.net",
+      "server_port": 8443
+    },
+    {
+      "type": "vless",
+      "tag": "srv2087",
+      "server": "vpn.example.net",
+      "server_port": 2087
+    },
+    {
+      "type": "urltest",
+      "tag": "urltest_out",
+      "outbounds": [
+        "srv8443"
+      ]
+    },
+    {
+      "type": "direct",
+      "tag": "direct_out"
+    },
+    {
+      "type": "block",
+      "tag": "block_out"
+    }
+  ],
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "udp://8.8.8.8",
+        "server": "8.8.8.8"
+      },
+      {
+        "type": "local",
+        "tag": "local"
+      },
+      {
+        "type": "dhcp",
+        "tag": "dhcp://auto"
+      },
+      {
+        "type": "https",
+        "tag": "https://1.1.1.1/dns-query",
+        "server": "1.1.1.1"
+      },
+      {
+        "type": "https",
+        "tag": "https://dns.google/dns-query",
+        "server": "dns.google"
+      },
+      {
+        "type": "https",
+        "tag": "detour:https://1.1.1.1/dns-query",
+        "server": "1.1.1.1",
+        "detour": "server-1"
+      },
+      {
+        "type": "https",
+        "tag": "detour:https://dns.google/dns-query",
+        "server": "dns.google",
+        "detour": "server-1"
+      },
+      {
+        "type": "local",
+        "tag": "local"
+      },
+      {
+        "type": "dhcp",
+        "tag": "dhcp://auto"
+      },
+      {
+        "type": "hosts",
+        "tag": "dns_hosts_out"
+      },
+      {
+        "type": "predefined",
+        "tag": "dns_block_out"
+      },
+      {
+        "type": "batch",
+        "tag": "dns_outbound_out",
+        "servers": [
+          "udp://8.8.8.8",
+          "local",
+          "dhcp://auto"
+        ]
+      },
+      {
+        "type": "batch",
+        "tag": "dns_direct_out",
+        "servers": [
+          "udp://8.8.8.8",
+          "local",
+          "dhcp://auto"
+        ]
+      },
+      {
+        "type": "batch",
+        "tag": "dns_proxy_out",
+        "servers": [
+          "detour:https://1.1.1.1/dns-query",
+          "detour:https://dns.google/dns-query",
+          "local",
+          "dhcp://auto"
+        ]
+      },
+      {
+        "type": "batch",
+        "tag": "dns_resolver_out",
+        "servers": [
+          "https://1.1.1.1/dns-query",
+          "local",
+          "dhcp://auto"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,558 @@
+#!/bin/bash
+# vpnguardd — сторож защиты (root, LaunchDaemon local.vpnguard).
+# Каждые 2 с: режим on — pf включён (всегда со своей ссылкой), в якоре наш набор: таблицы адресов
+# (VPN-серверы и DNS из VPN-клиента, российские IP) + правила; paused/off — всё своё убрано, pf как до нас.
+# Адреса из VPN-клиента: его данные macOS отдаёт только процессам пользователя с разрешением, поэтому
+# их читает иконка (или `vpnguard sync` из терминала) через адаптер клиента ("$BASE/provider.sh") и
+# кладёт выжимку в request/client; сторож берёт её от имени пользователя и проверяет каждый адрес. Адреса имён серверов узнаёт сам — только
+# у зашитых публичных резолверов по DNS-over-HTTPS напрямую (подделать ответ через конфиг нельзя),
+# раз в минуту в фоне; новое — в журнал и уведомлением через иконку.
+# Набор не собрался или не загрузился — запасные варианты вплоть до аварийного: якорь не остаётся пустым.
+# Каждый вызов pfctl — с таймаутом: pf не ответил за 10 с (похоже на зависание ядра) — сторож пишет
+# об этом, предупреждает и не плодит новые pfctl, пока зависший не вернётся.
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+set -u
+BASE="/Library/Application Support/VPNGuard"
+. "$BASE/state.sh"
+. "$BASE/provider.sh"   # адаптер VPN-клиента: только определения (docs/ADAPTERS.md)
+T="${VG_PROVIDER_TITLE:-VPN-клиент}"
+
+RULES="$BASE/vpnguard.rules"
+RU="$BASE/ru.cidr"
+ACTIVE="$BASE/active.rules"   # собранный набор: таблицы + правила — его и грузим в якорь
+MAP="$BASE/client.map"        # адреса из VPN-клиента, которые сейчас разрешены: «вид имя адрес,адрес»
+SEEN="$BASE/client.seen"      # когда адрес имени видели последний раз: «вид имя адрес время»
+EVENTS="$BASE/events"         # уведомления для иконки: «номер<TAB>время<TAB>текст»
+STATE="$BASE/state"
+STATUS="$BASE/status"
+REQ="$BASE/request"
+HANDOFF="$REQ/client"         # выжимка из настроек VPN-клиента (пишут иконка и `vpnguard sync`)
+TOKENS="$BASE/pf.tokens"
+HUNG="$BASE/pf.hung"          # pid и время старта pfctl, который не вернулся из ядра
+WORK="$BASE/work"             # временные файлы сторожа (только root)
+LOG=/Library/Logs/VPNGuard.log
+INTERVAL=2
+PF_TIMEOUT=10
+READ_TIMEOUT=3
+RESOLVE_EVERY=60
+RU_VERIFY_EVERY=60
+RU_SRC_EVERY=600
+OWNER_CHECK_EVERY=300
+ENABLE_EVERY=60
+MAX_ADDRS=16                  # адресов на одно имя: свежие плюс прежние за VG_ADDR_TTL
+
+REF_RULES=""; REF_TABLES=""; REF_RU=""; REPAIRS=0; LAST_REPAIR=0; APPLIED=""; LAST_STATUS=""; LAST_BEAT=0
+LOAD_ERR=0; HOOK_ERR=0; NEED_RELOAD=0; VARIANT=""; LAST_VARIANT_TRY=0; RU_MISSING=0
+KMTIME="-"; KLINES=""; KERR=""; KSTATE=start; LAST_KLOAD=0; RESOLVER_PID=""; LAST_RESOLVE=0
+LAST_RU_VERIFY=0; LAST_RU_SRC=0; RU_SRC=unknown; LAST_OWNER_CHECK=0; OWNER_RULES=unknown
+LAST_ENABLE=0; TOKEN_ERR=0; CLIENT_CHANGED=0
+
+log() {
+  if [ -f "$LOG" ] && [ "$(stat -f %z "$LOG")" -gt 1048576 ]; then mv -f "$LOG" "$LOG.1"; fi
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
+}
+
+write_atomic() { # путь содержимое
+  local tmp="$1.tmp.$$"
+  printf '%s\n' "$2" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$1"
+}
+
+event() { # текст → уведомление через иконку (и в журнал)
+  local last seq
+  last=$(tail -n 1 "$EVENTS" 2>/dev/null | cut -f1)
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  seq=$((last + 1))
+  printf '%s\t%s\t%s\n' "$seq" "$(date +%s)" "$*" >> "$EVENTS"
+  if [ "$(wc -l < "$EVENTS")" -gt 200 ]; then tail -n 100 "$EVENTS" > "$EVENTS.tmp" && mv -f "$EVENTS.tmp" "$EVENTS"; fi
+  chmod 644 "$EVENTS"
+  log "уведомление: $*"
+}
+
+# --- pfctl с таймаутом ---
+proc_id() { # pid → «pid время-старта»: pid мог достаться другому процессу, время старта — нет
+  printf '%s %s\n' "$1" "$(TZ=UTC LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ')"   # в UTC: смена пояса не сбивает сравнение
+}
+pf_hung() { # rc=0, если pfctl из прошлого вызова всё ещё не вернулся из ядра
+  local saved pid
+  [ -s "$HUNG" ] || return 1
+  saved=$(cat "$HUNG"); pid=${saved%% *}
+  if [[ $pid =~ ^[0-9]+$ ]] && [ "$(proc_id "$pid")" = "$saved" ] &&
+     [[ $(ps -p "$pid" -o command= 2>/dev/null) =~ (^|/)pfctl( |$) ]]; then return 0; fi
+  rm -f "$HUNG"; log "pf снова отвечает"; event "pf снова отвечает."
+  return 1
+}
+pfc() { # как pfctl, но не дольше PF_TIMEOUT; зависший вызов не убить — запоминаем и новых не запускаем
+  local pid out i rc
+  pf_hung && return 124
+  out=$(mktemp "$WORK/pf.XXXXXX") || return 1
+  pfctl "$@" > "$out" 2> "$out.err" &
+  pid=$!
+  # 10 раз по 0.01 с, потом по 0.05 с — всего около PF_TIMEOUT
+  for ((i = 0; i < 10 + PF_TIMEOUT * 20; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    if (( i < 10 )); then sleep 0.01; else sleep 0.05; fi
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    proc_id "$pid" > "$HUNG"
+    log "ОШИБКА: pfctl $* не ответил за $PF_TIMEOUT с — похоже, зависло ядро; сеть может не работать до перезагрузки"
+    event "pf не отвечает больше $PF_TIMEOUT секунд — похоже, зависло ядро. Сохрани работу и перезагрузи Mac."
+    return 124
+  fi
+  wait "$pid"; rc=$?
+  cat "$out"; cat "$out.err" >&2; rm -f "$out" "$out.err"
+  return $rc
+}
+
+run_limited() { # секунд файл команда… → вывод команды в файл; не уложилась — убиваем, rc=124
+  local secs=$1 outf=$2 pid i; shift 2
+  "$@" > "$outf" 2>/dev/null &
+  pid=$!
+  for ((i = 0; i < secs * 20; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+  if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; fi
+  wait "$pid"
+}
+
+pf_status()    { if pf_hung; then echo hung; else pfc -s info 2>/dev/null | awk '/^Status/{print $2}'; fi; }
+anchor_rules() { pfc -a "$VG_ANCHOR" -sr 2>/dev/null; }
+has_hook()     { pfc -sr 2>/dev/null | grep -q 'anchor "com.apple/\*"'; }
+tables_show()  { pfc -a "$VG_ANCHOR" -t vg_servers -T show 2>/dev/null; echo "--"; pfc -a "$VG_ANCHOR" -t vg_dns -T show 2>/dev/null; }
+ru_loaded()    { pfc -a "$VG_ANCHOR" -t vg_ru -T show 2>/dev/null | wc -l | tr -d ' '; }
+
+pf_enable() { # pf -E — счётчик ссылок; токены копим, чтобы потом отпустить ровно свои. rc=1 — не вызывали
+  local t now
+  now=$(date +%s)
+  # без токена в ответе -E не повторяем чаще раза в минуту: каждый -E — запись в pf и токен в ядре
+  if [ "$TOKEN_ERR" = 1 ] && (( now - LAST_ENABLE < ENABLE_EVERY )); then return 1; fi
+  LAST_ENABLE=$now
+  t=$(pfc -E 2>&1 | awk '/Token/{print $NF}')
+  if [ -n "$t" ]; then echo "$t" >> "$TOKENS"; TOKEN_ERR=0
+  elif ! pf_hung && [ "$TOKEN_ERR" = 0 ]; then TOKEN_ERR=1; log "ОШИБКА: pfctl -E не выдал токен — повторяю не чаще раза в минуту"; fi
+  return 0
+}
+pf_release_all() {
+  local t
+  [ -f "$TOKENS" ] || return 0
+  while read -r t; do [ -n "$t" ] && pfc -X "$t" >/dev/null 2>&1; done < "$TOKENS"
+  rm -f "$TOKENS"
+}
+
+repaired() { REPAIRS=$((REPAIRS + 1)); LAST_REPAIR=$(date +%s); log "ПОЧИНКА: $*"; }
+
+# --- адреса из VPN-клиента ---
+client_user() { # пользователь, чьи настройки клиента берём: записан установщиком; нет — владелец консоли
+  local u
+  u=$(cat "$BASE/user" 2>/dev/null)
+  [[ $u =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || u=$(stat -f %Su /dev/console 2>/dev/null)
+  [ "$u" != root ] && [[ $u =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] && echo "$u"
+}
+
+client_load() { # выжимка → KLINES (строки vg_parse_extract) и KERR (что не так с выжимкой).
+                # Читает пользователь: root файлы из общего request/ не открывает (симлинк на закрытый файл ничего не выдаст)
+  local u perms raw rc
+  KLINES=""; KERR=""
+  u=$(client_user)
+  [ -n "$u" ] || { KERR=nouser; return 0; }
+  # request/ общий (1777): файл мог заранее создать процесс другого пользователя. Берём только обычный
+  # файл (не симлинк) этого пользователя без записи для группы и всех; подменить такой файл в каталоге
+  # со sticky-битом чужой пользователь уже не может
+  perms=$(stat -f %Lp "$HANDOFF" 2>/dev/null)
+  if [ -L "$HANDOFF" ] || [ ! -f "$HANDOFF" ] || [ "$(stat -f %Su "$HANDOFF" 2>/dev/null)" != "$u" ] ||
+     ! [[ $perms =~ ^[0-7]+$ ]] || (( 8#$perms & 8#022 )); then
+    KERR=foreign; return 0
+  fi
+  # между проверкой и чтением файл могли подменить каналом (FIFO) — чтение с таймаутом, цикл не встанет
+  # не больше 256 КБ уже при чтении: огромный файл не должен копироваться на системный диск
+  run_limited "$READ_TIMEOUT" "$WORK/handoff" sudo -n -u "$u" /usr/bin/head -c 262144 "$HANDOFF"; rc=$?
+  if [ $rc = 124 ]; then KERR=timeout; rm -f "$WORK/handoff"; return 0; fi
+  raw=$(cat "$WORK/handoff"); rm -f "$WORK/handoff"
+  KERR=$(printf '%s\n' "$raw" | sed -n 's/^# error: *\([a-z]*\).*/\1/p' | head -1)
+  KLINES=$(printf '%s\n' "$raw" | grep -v '^#' | vg_parse_extract)
+}
+
+resolve_name() { # интерфейс имя → адреса через пробел (A и AAAA) от зашитых резолверов по DoH
+  local r t out a
+  [ -n "$1" ] || return 0
+  for r in $VG_RESOLVERS; do
+    out=$(for t in A AAAA; do
+            curl -s --max-time 4 --interface "$1" -H 'accept: application/dns-json' "$(vg_doh_url "$r" "$2" "$t")" 2>/dev/null |
+              /usr/bin/jq -r "$VG_DOH_JQ" 2>/dev/null
+          done | while read -r a; do if vg_is_ipv4 "$a" || vg_is_ipv6 "$a"; then echo "$a"; fi; done | sort -u | paste -sd' ' -)
+    if [ -n "$out" ]; then echo "$out"; return 0; fi
+  done
+}
+
+resolve_all() { # (в фоне) KLINES + прежние адреса → новая карта на stdout, отметки времени — в WORK/seen.new
+  local kind name addrs fresh keep kept now phys n=0 a
+  now=$(date +%s)
+  phys=$(netstat -rn -f inet 2>/dev/null | vg_phys_iface)
+  : > "$WORK/seen.new"
+  printf '%s\n' "$KLINES" | while read -r kind name; do
+    case $kind in server|dns) ;; *) continue ;; esac
+    n=$((n + 1)); (( n <= VG_MAX_NAMES )) || continue
+    if vg_is_ipv4 "$name" || vg_is_ipv6 "$name"; then
+      echo "$kind $name $name"; continue
+    fi
+    [ "$kind" = server ] || continue   # DNS по имени не берём (vg_parse_extract и не выдаёт)
+    fresh=$(resolve_name "$phys" "$name")
+    for a in $fresh; do echo "$kind $name $a $now" >> "$WORK/seen.new"; done
+    # прежние адреса (кроме свежих) — пока их видели не раньше VG_ADDR_TTL назад; свежие сначала
+    kept=$(awk -v k="$kind" -v n="$name" -v lim=$((now - VG_ADDR_TTL)) -v fresh=" $fresh " \
+             '$1 == k && $2 == n && $4 >= lim && index(fresh, " " $3 " ") == 0' "$SEEN" 2>/dev/null | sort -k4,4nr)
+    [ -n "$kept" ] && printf '%s\n' "$kept" >> "$WORK/seen.new"
+    keep=$(printf '%s\n' "$kept" | awk 'NF { print $3 }')
+    addrs=$( { printf '%s\n' $fresh; printf '%s\n' $keep; } | grep -v '^$' | awk '!seen[$0]++' | head -n "$MAX_ADDRS" | sort | paste -sd, -)
+    echo "$kind $name ${addrs:--}"
+  done | sort
+}
+
+map_show() { # вид → «имя (адреса), …» для статуса и уведомлений
+  [ -f "$MAP" ] || return 0
+  awk -v k="$1" '$1 == k { a = $3; gsub(",", ", ", a); if ($2 == $3) out = out sep $2; else if ($3 == "-") out = out sep $2 " (?)"; else out = out sep $2 " (" a ")"; sep = ", " } END { print out }' "$MAP"
+}
+
+announce() { # первый_раз diff-строки → события и журнал
+  local first=$1 sign kind name a b added s=""
+  if [ "$first" = 1 ]; then
+    event "Защита взяла адреса из $T. VPN-серверы: $(map_show server). DNS: $(map_show dns)."
+    return 0
+  fi
+  while read -r sign kind name a b; do
+    [ -n "$sign" ] || continue
+    case "$sign $kind" in
+      "+ server")
+        if [ "$a" = "$name" ]; then s=$name; elif [ "$a" = - ]; then s="$name (адрес пока не узнал)"; else s="$name (${a//,/, })"; fi
+        event "В список защиты добавлен VPN-сервер $s — из профиля $T. Если ты не менял профиль, проверь, откуда он." ;;
+      "+ dns")
+        event "В список защиты добавлен DNS-сервер $name — из настроек $T. К нему напрямую открыты порты 53, 443 и 853. Если ты не менял настройки DNS в $T, проверь." ;;
+      "~ server")
+        added=$(comm -13 <(printf '%s\n' ${a//,/ } | sort) <(printf '%s\n' ${b//,/ } | sort) | grep -v '^-$' | paste -sd' ' -)
+        if [ -n "$added" ]; then event "У VPN-сервера $name новый адрес: ${added// /, } (по данным публичного DNS)."; else log "адреса VPN-сервера $name: $a → $b"; fi ;;
+      "~ dns")   log "адреса DNS-сервера $name: $a → $b" ;;
+      "- "*)     log "убран из списка (нет в настройках $T или адрес устарел): $kind $name $a" ;;
+    esac
+  done <<< "$2"
+}
+
+client_apply() { # фоновый разрешатель закончил: новая карта → события, таблицы при следующей проверке
+  local first=0 d
+  [ -f "$WORK/seen.new" ] && { mv -f "$WORK/seen.new" "$SEEN"; chmod 644 "$SEEN"; }
+  [ -s "$WORK/map.new" ] || return 0   # клиент не прочитан — держим прежнее
+  if cmp -s "$WORK/map.new" "$MAP"; then rm -f "$WORK/map.new"; return 0; fi
+  [ -f "$MAP" ] || first=1
+  d=$(vg_addr_diff "$MAP" "$WORK/map.new")
+  mv -f "$WORK/map.new" "$MAP"; chmod 644 "$MAP"
+  announce "$first" "$d"
+  NEED_RELOAD=1; CLIENT_CHANGED=1
+}
+
+client_tick() { # now — следим за выжимкой из VPN-клиента и разрешаем имена (в фоне, цикл не ждёт)
+  local m bad st names
+  if [ -n "$RESOLVER_PID" ]; then
+    if kill -0 "$RESOLVER_PID" 2>/dev/null; then return 0; fi
+    wait "$RESOLVER_PID" 2>/dev/null; RESOLVER_PID=""
+    client_apply
+  fi
+  # %Fc — смена прав и владельца тоже повод перечитать; F — с долями секунды (в ту же секунду тоже)
+  m=$(stat -f '%Fm %Fc %z %i' "$HANDOFF" 2>/dev/null)
+  # выжимка изменилась — читаем; прошлое чтение не удалось — пробуем снова раз в RESOLVE_EVERY
+  if [ "$m" != "$KMTIME" ] || { [ "$KSTATE" != ok ] && (( $1 - LAST_KLOAD >= RESOLVE_EVERY )); }; then
+    KMTIME=$m; LAST_KLOAD=$1
+    if [ -z "$m" ]; then KLINES=""; KERR=""; st=none
+    else
+      client_load
+      if [ -n "$KERR" ]; then st=$KERR
+      elif printf '%s\n' "$KLINES" | grep -q '^server '; then st=ok
+      else st=empty; fi
+    fi
+    if [ "$st" != "$KSTATE" ]; then
+      case $st in
+        ok)      log "выжимка из $T получена" ;;
+        none)    log "выжимки из $T нет — держу прежние адреса" ;;
+        denied)  log "macOS не пускает к настройкам $T — держу прежние адреса"
+                 event "macOS не даёт VPN Guard читать настройки $T, новые серверы не подхватятся. Разреши доступ (см. памятку) или выполни в терминале: vpnguard sync" ;;
+        foreign) log "выжимка из $T не от пользователя (владелец, тип или права не те) — не беру, держу прежние адреса"
+                 event "Файл с адресами из $T подложил не ты (другой владелец, права или тип). Защита его не берёт. Проверь: vpnguard status" ;;
+        timeout) log "выжимка из $T не прочиталась за $READ_TIMEOUT с — держу прежние адреса" ;;
+        *)       log "в выжимке из $T нет серверов ($st) — держу прежние адреса" ;;
+      esac
+      KSTATE=$st
+    fi
+    if [ "$st" = ok ]; then
+      bad=$(printf '%s\n' "$KLINES" | sed -n 's/^bad //p' | head -5 | paste -sd' ' -)
+      [ -n "$bad" ] && log "в настройках $T пропустил странные адреса: $bad"
+      names=$(printf '%s\n' "$KLINES" | sed -n 's/^dnsname //p' | head -5 | paste -sd' ' -)
+      [ -n "$names" ] && log "DNS-серверы $T по имени не беру (только адресом): $names"
+      (( $(printf '%s\n' "$KLINES" | grep -c -E '^(server|dns) ') > VG_MAX_NAMES )) &&
+        log "в настройках $T больше $VG_MAX_NAMES серверов и DNS — беру первые $VG_MAX_NAMES"
+    fi
+    LAST_RESOLVE=0
+  fi
+  [ "$KSTATE" = ok ] || return 0
+  if [ ! -f "$MAP" ]; then   # первый раз — сразу, не в фоне: без адресов серверов клиент не подключится
+    LAST_RESOLVE=$1
+    resolve_all > "$WORK/map.new" 2>/dev/null
+    client_apply
+  elif (( $1 - LAST_RESOLVE >= RESOLVE_EVERY )); then
+    LAST_RESOLVE=$1
+    resolve_all > "$WORK/map.new" 2>/dev/null &
+    RESOLVER_PID=$!
+  fi
+}
+
+ru_src_tick() { # now — клиент обновил свой список российских IP (VG_PROVIDER_RU_SRC)? Тогда наш устарел
+  local want have
+  (( $1 - LAST_RU_SRC >= RU_SRC_EVERY )) || return 0
+  LAST_RU_SRC=$1
+  [ -n "${VG_PROVIDER_RU_SRC:-}" ] || { RU_SRC=unknown; return 0; }
+  want=$(vg_ru_sha "$RU"); have=""
+  # файл клиента может лежать там, куда пишет пользователь: только обычный файл и с таймаутом —
+  # подменённый каналом (FIFO) он не повесит цикл сторожа
+  if [ -f "$VG_PROVIDER_RU_SRC" ] && run_limited "$READ_TIMEOUT" "$WORK/rusrc" shasum -a 256 "$VG_PROVIDER_RU_SRC"; then
+    have=$(awk '{print $1}' "$WORK/rusrc")
+  fi
+  rm -f "$WORK/rusrc"
+  if [ -z "$want" ] || [ -z "$have" ]; then RU_SRC=unknown
+  elif [ "$want" = "$have" ]; then RU_SRC=same
+  else
+    if [ "$RU_SRC" != changed ]; then
+      event "$T обновил список российских IP. Часть российских сайтов может не открываться напрямую — обнови список защиты (tools/srs2cidr.py) и поставь vpnguard update."
+    fi
+    RU_SRC=changed
+  fi
+}
+
+owner_tick() { # now — нет ли где-то в pf (в том числе в чужих якорях) правил с проверкой владельца
+               # пакета: pf под своей блокировкой ищет сокет, и ядро может уйти во взаимоблокировку
+  local a hits=""
+  (( $1 - LAST_OWNER_CHECK >= OWNER_CHECK_EVERY )) || return 0
+  LAST_OWNER_CHECK=$1
+  for a in "" $(pfc -sA -v 2>/dev/null); do
+    if pfc ${a:+-a "$a"} -sr 2>/dev/null | grep -Eq ' (user|group) |\(([a-z, ]*)?user'; then hits="$hits ${a:-основной набор}"; fi
+  done
+  pf_hung && return 0
+  if [ -n "$hits" ]; then
+    if [ "$OWNER_RULES" != present ]; then
+      log "ВНИМАНИЕ: в pf есть правила с проверкой владельца пакета (user/group):$hits — такие правила могут повесить ядро macOS; это не правила VPN Guard"
+      event "В pf нашлись чужие правила с проверкой владельца пакета (якорь:$hits). Такие правила могут повесить сеть macOS. Это не VPN Guard — найди программу, которая их поставила."
+    fi
+    OWNER_RULES=present
+  else
+    [ "$OWNER_RULES" = present ] && log "правил с проверкой владельца в pf больше нет"
+    OWNER_RULES=none
+  fi
+}
+
+# --- набор правил ---
+compose_variant() { # вариант → набор в WORK/active.new; rc не 0 — вариант собрать нельзя
+  local servers dns
+  servers=$(vg_map_addrs "$MAP" server)
+  dns=$(vg_words_uniq "$(vg_map_addrs "$MAP" dns) $VG_RESOLVERS")
+  case $1 in
+    full)      vg_rules_complete "$RULES" && vg_compose_rules "$servers" "$dns" "$RU" "$RULES" ;;
+    noclient)  vg_rules_complete "$RULES" && vg_compose_rules "" "$VG_RESOLVERS" "$RU" "$RULES" ;;
+    noru)      vg_rules_complete "$RULES" && vg_compose_rules "$servers" "$dns" /nonexistent "$RULES" ;;
+    emergency) vg_emergency_rules "$servers" "$dns" ;;
+    bare)      vg_emergency_rules "" "$VG_RESOLVERS" ;;
+  esac > "$WORK/active.new"
+}
+
+load_rules() { # собрать и загрузить набор; не вышло — следующий вариант. rc=124 — pf завис
+  local v rc err="" first=""
+  [ -r "$RU" ] || { [ "$RU_MISSING" = 0 ] && { RU_MISSING=1; log "ОШИБКА: нет $RU — российские сайты напрямую не откроются"
+                    event "Пропал список российских сетей защиты — российские сайты напрямую не откроются. Поставь защиту заново: sudo ~/Tools/vpnguard/install.sh"; }; }
+  [ -r "$RU" ] && RU_MISSING=0
+  for v in full noclient noru emergency bare; do
+    compose_variant "$v" || { [ -n "$first" ] || first="$v: файл правил повреждён"; continue; }
+    pfc -nf "$WORK/active.new" > /dev/null 2> "$WORK/pf.err"; rc=$?
+    [ $rc = 124 ] && return 124
+    if [ $rc = 0 ]; then
+      pfc -a "$VG_ANCHOR" -f "$WORK/active.new" > /dev/null 2> "$WORK/pf.err"; rc=$?
+      [ $rc = 124 ] && return 124
+      if [ $rc != 0 ]; then   # -n принял, а загрузка нет — бывает разово; один повтор до понижения варианта
+        sleep 0.2
+        pfc -a "$VG_ANCHOR" -f "$WORK/active.new" > /dev/null 2> "$WORK/pf.err"; rc=$?
+        [ $rc = 124 ] && return 124
+      fi
+      if [ $rc = 0 ]; then
+        mv -f "$WORK/active.new" "$ACTIVE"; chmod 644 "$ACTIVE"
+        if [ "$v" != "$VARIANT" ]; then
+          if [ "$v" = full ]; then
+            [ -n "$VARIANT" ] && log "основной набор правил снова загружен"
+          else
+            log "ОШИБКА: основной набор не загрузился (${first:-$(head -c 200 "$WORK/pf.err")}) — загрузил вариант «${v}»"
+            case $v in
+              noclient)  event "Защита не смогла принять адреса серверов из $T — VPN может не подключиться. Проверь: vpnguard status" ;;
+              noru)      event "Защита не смогла загрузить список российских сетей — российские сайты напрямую не откроются. Поставь защиту заново: sudo ~/Tools/vpnguard/install.sh" ;;
+              *)         event "Правила защиты повреждены — включён аварийный набор (только туннель и локальная сеть). Поставь защиту заново: sudo ~/Tools/vpnguard/install.sh" ;;
+            esac
+          fi
+          VARIANT=$v
+        fi
+        LAST_VARIANT_TRY=$(date +%s)
+        return 0
+      fi
+    fi
+    [ -n "$first" ] || first="$v: $(tr '\n' ' ' < "$WORK/pf.err" | head -c 200)"
+  done
+  return 1
+}
+
+apply_on() { # cur_rules
+  local cur=$1 curt tampered=0 ru_lost=0 now
+  if ! has_hook; then
+    pf_hung && return 0
+    pfc -f /etc/pf.conf >/dev/null 2>&1
+    pf_hung && return 0
+    if has_hook; then
+      HOOK_ERR=0
+      # до первого применения (например, сторож стартовал раньше com.apple.pfctl) — не починка
+      if [ "$APPLIED" = on ]; then repaired "в основном наборе pf не было anchor com.apple/* — перечитал /etc/pf.conf"
+      else log "в основном наборе pf не было anchor com.apple/* — перечитал /etc/pf.conf"; fi
+    elif [ "$HOOK_ERR" = 0 ]; then
+      pf_hung && return 0
+      HOOK_ERR=1; log "ОШИБКА: в основном наборе pf нет anchor com.apple/*, перечитать /etc/pf.conf не вышло — правила не действуют"
+    fi
+  fi
+  curt=$(tables_show)
+  pf_hung && return 0
+  now=$(date +%s)
+  # загружен запасной вариант — раз в RESOLVE_EVERY пробуем основной снова
+  if [ -n "$VARIANT" ] && [ "$VARIANT" != full ] && (( now - LAST_VARIANT_TRY >= RESOLVE_EVERY )); then NEED_RELOAD=1; fi
+  if [ -n "$REF_RULES" ] && (( now - LAST_RU_VERIFY >= RU_VERIFY_EVERY )); then
+    LAST_RU_VERIFY=$now
+    [ "$(ru_loaded)" = "$REF_RU" ] || ru_lost=1
+    pf_hung && return 0
+  fi
+  if [ -z "$REF_RULES" ] || [ "$cur" != "$REF_RULES" ] || [ "$curt" != "$REF_TABLES" ] || [ "$ru_lost" = 1 ] || [ "$NEED_RELOAD" = 1 ]; then
+    if [ -n "$REF_RULES" ] && { [ "$cur" != "$REF_RULES" ] || [ "$curt" != "$REF_TABLES" ] || [ "$ru_lost" = 1 ]; }; then tampered=1; fi
+    load_rules; case $? in
+      0)
+        REF_RULES=$(anchor_rules); REF_TABLES=$(tables_show); REF_RU=$(ru_loaded); LAST_RU_VERIFY=$now; LOAD_ERR=0
+        pf_hung && return 0
+        [ "$CLIENT_CHANGED" = 1 ] && [ "$APPLIED" = on ] && log "адреса из $T обновлены в правилах"
+        NEED_RELOAD=0; CLIENT_CHANGED=0
+        # загрузка при старте или после паузы — не починка; иначе правила или таблицы кто-то снёс или подменил
+        if [ "$APPLIED" = on ] && [ "$tampered" = 1 ]; then repaired "правила или таблицы в якоре пропали или изменены — загрузил заново"; fi ;;
+      124) return 0 ;;
+      *)
+        if [ "$LOAD_ERR" = 0 ]; then
+          LOAD_ERR=1; log "ОШИБКА: pfctl не загрузил ни один вариант набора, даже аварийный (повторяю каждые $INTERVAL с)"
+          event "Защита не смогла загрузить правила — сейчас она не действует. Проверь: vpnguard status"
+        fi ;;
+    esac
+  fi
+  # своя ссылка pf держится всегда — иначе чужой pfctl -X (ALF, раздача интернета) выключил бы pf
+  case $(pf_status) in
+    Enabled) [ -s "$TOKENS" ] || pf_enable ;;
+    hung)    return 0 ;;
+    *)       if pf_enable; then
+               pf_hung && return 0
+               if [ "$APPLIED" = on ]; then repaired "pf был выключен — включил"; fi
+             fi ;;
+  esac
+  if [ "$APPLIED" != on ]; then log "защита ВКЛЮЧЕНА"; APPLIED=on; fi
+}
+
+apply_off() { # paused|off  cur_rules
+  if [ -n "$2" ]; then
+    pfc -a "$VG_ANCHOR" -F rules >/dev/null 2>&1
+    pfc -a "$VG_ANCHOR" -F Tables >/dev/null 2>&1
+  fi
+  pf_release_all
+  REF_RULES=""; REF_TABLES=""; VARIANT=""
+  if [ "$APPLIED" != "$1" ]; then log "защита СНЯТА ($1)"; APPLIED=$1; fi
+}
+
+write_status() { # now eff until
+  local rules hook pf content
+  if [ -n "$(anchor_rules)" ]; then rules=loaded; else rules=absent; fi
+  if has_hook; then hook=present; else hook=absent; fi
+  pf=$(pf_status)
+  content="mode=$2
+until=$3
+rules=$rules
+hook=$hook
+pf=$pf
+variant=${VARIANT:-}
+repairs=$REPAIRS
+last_repair=$LAST_REPAIR
+servers=$(map_show server)
+dns=$(map_show dns)
+client=$KSTATE
+provider=$T
+ru=$(vg_ru_count "$RU")
+ru_src=$RU_SRC
+owner_rules=$OWNER_RULES"
+  if [ "$content" != "$LAST_STATUS" ] || (( $1 - LAST_BEAT >= 10 )); then
+    write_atomic "$STATUS" "$content
+heartbeat=$1"
+    LAST_STATUS=$content; LAST_BEAT=$1
+  fi
+}
+
+read_state() {
+  local s; s=$(cat "$STATE" 2>/dev/null)
+  MODE=$(printf '%s\n' "$s" | vg_kv mode)
+  UNTIL=$(printf '%s\n' "$s" | vg_kv until)
+  BOOT=$(printf '%s\n' "$s" | vg_kv boot)
+}
+set_state() { write_atomic "$STATE" "$(vg_state_render "$1" "$2" "$CUR_BOOT")"; }
+
+# --- старт ---
+mkdir -p "$REQ"; chmod 1777 "$REQ"
+rm -rf "$WORK"; mkdir -p "$WORK"; chmod 700 "$WORK"
+touch "$LOG"; chmod 644 "$LOG"
+touch "$EVENTS"; chmod 644 "$EVENTS"
+CUR_BOOT=$(vg_boot_id)
+read_state
+if [ "$BOOT" != "$CUR_BOOT" ]; then
+  rm -f "$TOKENS" "$HUNG"   # токены и pid прошлой загрузки недействительны
+  set_state on 0
+  log "старт после загрузки: защита включена (было: ${MODE:-нет состояния})"
+else
+  log "старт сторожа (перезапуск в той же загрузке), режим: ${MODE:-on}"
+fi
+
+trap ':' USR1   # CLI будит сторожа после смены состояния
+trap 'log "сторож остановлен (правила оставлены как есть)"; [ -n "$RESOLVER_PID" ] && kill "$RESOLVER_PID" 2>/dev/null; exit 0' TERM INT
+
+while :; do
+  now=$(date +%s)
+  if [ -e "$REQ/on" ] || [ -L "$REQ/on" ]; then
+    rm -rf "$REQ/on"   # -r: «запрос» может оказаться каталогом; симлинк удаляется сам, без перехода
+    read_state
+    if [ "${MODE:-on}" != on ]; then set_state on 0; log "включено по запросу пользователя (без пароля)"; fi
+  fi
+  read_state
+  if [ "$BOOT" != "$CUR_BOOT" ]; then
+    # состояние не от этой загрузки (запись при старте не удалась) — только on
+    MODE=on; UNTIL=0; set_state on 0
+  fi
+  eff=$(vg_effective_mode "$MODE" "$UNTIL" "$now")
+  if [ "$MODE" = paused ] && [ "$eff" = on ]; then
+    # пауза кончилась; перечитываем, чтобы не затереть только что записанную команду root
+    prev=$UNTIL; read_state
+    if [ "$MODE" = paused ] && [ "$UNTIL" = "$prev" ]; then set_state on 0; log "пауза кончилась"
+    else eff=$(vg_effective_mode "$MODE" "$UNTIL" "$now"); fi
+  fi
+  if ! pf_hung; then   # pf завис в ядре — чинить нечем, только честный статус
+    owner_tick "$now"
+    cur=$(anchor_rules)
+    if ! pf_hung; then
+      case $eff in
+        on)     apply_on "$cur" ;;
+        paused) apply_off paused "$cur" ;;
+        *)      apply_off off "$cur" ;;
+      esac
+    fi
+  fi
+  # после правил: на первом старте (карты ещё нет) имена разрешаются синхронно, и это не должно
+  # задерживать загрузку правил; новые адреса попадут в набор на следующем цикле
+  client_tick "$now"
+  ru_src_tick "$now"
+  [ "$eff" = paused ] && until=$UNTIL || until=0
+  write_status "$now" "$eff" "$until"
+  sleep "$INTERVAL" & SP=$!
+  wait "$SP" 2>/dev/null
+  kill "$SP" 2>/dev/null
+done

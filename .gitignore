@@ -1,0 +1,7 @@
+tests/nwprobe
+.DS_Store
+tests/step0.log
+tests/step0-blocked.txt
+build/
+tests/acceptance.log
+precheck.log
