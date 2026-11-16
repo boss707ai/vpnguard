@@ -30,7 +30,7 @@ DAEMON_PLIST=/Library/LaunchDaemons/local.vpnguard.plist
 AGENT_PLIST=/Library/LaunchAgents/local.vpnguard.menubar.plist
 FILES="daemon/vpnguardd cli/vpnguard lib/state.sh pf/vpnguard.rules pf/ru.cidr ПАМЯТКА.md install.sh uninstall.sh
 launchd/local.vpnguard.plist launchd/local.vpnguard.menubar.plist app/VPNGuard.swift app/Info.plist
-tests/acceptance.sh tests/soak.sh tests/nwprobe.swift tests/test_state.sh"
+tests/acceptance.sh tests/soak.sh tests/nwprobe.swift tests/test_state.sh tools/jq.sha256"
 FILES+=" $PFILE"   # адаптер VPN-клиента — тоже код от root: та же проверка и тот же diff
 
 STAGE=$(mktemp -d /private/var/tmp/vpnguard-install.XXXXXX)   # root, 700
@@ -184,6 +184,43 @@ CHECK_FILES=""; for f in $FILES; do CHECK_FILES="$CHECK_FILES $S/$f"; done
 ' $CHECK_FILES || { echo "Отказ: в файлах недопустимые символы — в diff было бы видно не то, что исполнится."; exit 1; }
 echo "текст файлов: ок"
 
+# jq. В macOS 15 и новее он встроенный (/usr/bin/jq) — ставить нечего. В macOS 14 его нет: ставим копию
+# root "$BASE/bin/jq" — официальную сборку jq. Бинарник в diff не покажешь, поэтому берём только файл с
+# sha256 из tools/jq.sha256 (это текст: он прошёл проверку символов выше и виден в diff) и только под
+# процессор этого Mac. Откуда, по порядку: bin/jq из исходников (его качают precheck и tools/get-jq.sh),
+# уже стоящая копия root (обновление), скачивание с github.com/jqlang. Файл с другой суммой не берём,
+# откуда бы он ни был. До «y» jq не исполняется.
+JQ_NEED=0; JQ_FROM=""; JQ_ARCH=""; JQ_HAVE=""
+if [ ! -x /usr/bin/jq ]; then
+  JQ_NEED=1
+  if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then JQ_ARCH=jq-macos-arm64; else JQ_ARCH=jq-macos-amd64; fi
+  JQ_WANT=$(awk -v n="$JQ_ARCH" 'length($1) == 64 && $1 !~ /[^0-9a-f]/ && $2 == n { print $1; exit }' "$S/tools/jq.sha256")
+  [ -n "$JQ_WANT" ] || { echo "Отказ: в tools/jq.sha256 нет суммы для $JQ_ARCH"; exit 1; }
+  mkdir -p "$S/bin"
+  jq_ok() { [ "$(shasum -a 256 "$S/bin/jq" | awk '{print $1}')" = "$JQ_WANT" ]; }
+  # из исходников — от пользователя, как остальные файлы
+  if [ -f "$SRC/bin/jq" ] && sudo -u "$U" cat "$SRC/bin/jq" > "$S/bin/jq" 2>/dev/null && jq_ok; then JQ_FROM="$SRC/bin/jq"
+  elif [ -f "$BASE/bin/jq" ] && cp "$BASE/bin/jq" "$S/bin/jq" && jq_ok; then JQ_FROM="$BASE/bin/jq (уже стоит)"
+  else
+    JQ_V=$(sed -n 's|^# Официальные сборки jq [0-9.]*: https://github\.com/jqlang/jq/releases/tag/jq-\([0-9.]*\)$|\1|p' "$S/tools/jq.sha256" | head -1)
+    [ -n "$JQ_V" ] || { echo "Отказ: в tools/jq.sha256 нет строки с версией jq — не знаю, что скачать"; exit 1; }
+    JQ_URL="https://github.com/jqlang/jq/releases/download/jq-$JQ_V/$JQ_ARCH"
+    echo "jq: подходящего нет, скачиваю $JQ_URL"
+    # качает пользователь, а не root, и сразу в закрытый каталог root; -q — без ~/.curlrc пользователя;
+    # только https, в том числе при переадресации. Что бы ни пришло, ставим только с суммой из списка
+    sudo -u "$U" curl -q -fsSL --max-time 120 --proto '=https' "$JQ_URL" > "$S/bin/jq" 2>/dev/null ||
+      { echo "Не скачал jq (нет интернета?). Скачай вручную, без sudo: $SRC/tools/get-jq.sh — и запусти установку снова."; exit 1; }
+    jq_ok || { echo "Отказ: скачанный jq не совпадает с tools/jq.sha256 для $JQ_ARCH"; exit 1; }
+    JQ_FROM="$JQ_URL"
+  fi
+  if [ -f "$SRC/bin/jq" ] && [ "$JQ_FROM" != "$SRC/bin/jq" ]; then
+    echo "ВНИМАНИЕ: $SRC/bin/jq не подходит (не читается или sha256 не из tools/jq.sha256) — его не беру; обновить: $SRC/tools/get-jq.sh"
+  fi
+  JQ_HAVE=$JQ_WANT
+  chmod 755 "$S/bin/jq"
+  echo "jq: встроенного нет, ставлю $JQ_FROM ($JQ_ARCH, sha256 из tools/jq.sha256)"
+fi
+
 # Список российских сетей сделан из того же файла, по которому решает VPN-клиент? Шапка ru.cidr хранит
 # sha256 источника — сверяем с файлом клиента из адаптера. Адаптер здесь не исполняется (до «y» — только
 # чтение): путь и название берём из его текста.
@@ -228,6 +265,12 @@ if [ -d "$BASE/src" ]; then
       diff -a -u "$old" "$S/$f" | tail -n +3 | LC_ALL=C sed $'s/[\x01-\x08\x0b-\x1f\x7f]/?/g' || true
     fi
   done
+  # jq — бинарник: вместо diff — что это за файл; сверяем с тем, что реально стоит
+  if [ "$JQ_NEED" = 1 ] && ! cmp -s "$BASE/bin/jq" "$S/bin/jq"; then
+    CHANGED=1; echo "--- bin/jq (бинарник, в diff не показать): $JQ_ARCH, sha256 $JQ_HAVE — есть в tools/jq.sha256"
+  elif [ "$JQ_NEED" = 0 ] && [ -e "$BASE/bin" ]; then
+    CHANGED=1; echo "--- bin/jq: больше не нужен (есть встроенный /usr/bin/jq) — будет удалён"
+  fi
   if [ "$CHANGED" = 1 ]; then
     echo
     printf 'Ставлю эти изменения от root? Напиши y и Enter: '
@@ -257,6 +300,9 @@ install -d -o root -g wheel -m 755 "$BASE" "$BASE/tests"
 install -o root -g wheel -m 755 "$S/daemon/vpnguardd" "$S/cli/vpnguard" "$S/install.sh" "$S/uninstall.sh" "$BASE/"
 install -o root -g wheel -m 644 "$S/lib/state.sh" "$S/pf/vpnguard.rules" "$S/pf/ru.cidr" "$S/ПАМЯТКА.md" "$BASE/"
 install -o root -g wheel -m 644 "$S/$PFILE" "$BASE/provider.sh"
+if [ "$JQ_NEED" = 1 ]; then
+  install -d -o root -g wheel -m 755 "$BASE/bin"; install -o root -g wheel -m 755 "$S/bin/jq" "$BASE/bin/jq"
+else rm -rf "$BASE/bin"; fi   # встроенный /usr/bin/jq (macOS 15+) — своя копия не нужна
 rm -f "$BASE/karing.map" "$BASE/karing.seen" "$BASE/request/karing"   # файлы версий до адаптеров
 install -o root -g wheel -m 755 "$S/tests/acceptance.sh" "$S/tests/soak.sh" "$B/nwprobe" "$BASE/tests/"
 install -d -o root -g wheel -m 1777 "$BASE/request"

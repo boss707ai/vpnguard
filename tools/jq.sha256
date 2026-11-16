@@ -1,0 +1,7 @@
+# jq для macOS 14: там нет встроенного /usr/bin/jq (он появился в macOS 15).
+# Официальные сборки jq 1.8.2: https://github.com/jqlang/jq/releases/tag/jq-1.8.2
+# Суммы — из sha256sum.txt релиза, сверены с digest файлов в GitHub API и со скачанными файлами.
+# Установщик ставит только jq с суммой из этого списка; список — текст, он проходит diff и «y».
+# Сменить версию: строка «Официальные сборки…» (по ней качает tools/get-jq.sh) и обе суммы.
+e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0  jq-macos-amd64
+2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e  jq-macos-arm64

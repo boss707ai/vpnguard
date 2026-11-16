@@ -4,6 +4,11 @@
 VG_BASE="/Library/Application Support/VPNGuard"
 VG_ANCHOR="com.apple/999.vpnguard"
 VG_MAX_PAUSE=86400   # сутки
+# jq. В macOS 15 и новее — встроенный /usr/bin/jq. В macOS 14 его нет: install.sh ставит копию root —
+# официальную сборку, сверив её sha256 со списком tools/jq.sha256. jq из каталогов пользователя
+# (Homebrew и т. п.) отсюда не берём никогда: сторож от root исполнил бы файл, который может подменить
+# любой процесс пользователя. Тесты и precheck (от пользователя) подставляют сюда bin/jq из исходников.
+VG_JQ_LOCAL="$VG_BASE/bin/jq"
 
 # vg_parse_duration "15m" → секунды. Форматы: N (минуты), Ns, Nm, Nh. От 60 с до 24 ч, иначе rc=1.
 vg_parse_duration() {
@@ -27,6 +32,9 @@ vg_effective_mode() {
     *) echo on ;;
   esac
 }
+
+# vg_jq АРГУМЕНТЫ… → jq с этими аргументами: встроенный, иначе копия VPN Guard (нет обоих — rc=127)
+vg_jq() { if [ -x /usr/bin/jq ]; then /usr/bin/jq "$@"; else "$VG_JQ_LOCAL" "$@"; fi; }
 
 # vg_kv KEY < текст → значение первой строки KEY=...
 vg_kv() { sed -n "s/^$1=//p" | head -1; }

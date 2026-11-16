@@ -5,3 +5,4 @@ tests/step0-blocked.txt
 build/
 tests/acceptance.log
 precheck.log
+bin/

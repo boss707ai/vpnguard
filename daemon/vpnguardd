@@ -175,7 +175,7 @@ resolve_name() { # интерфейс имя → адреса через про�
   for r in $VG_RESOLVERS; do
     out=$(for t in A AAAA; do
             curl -s --max-time 4 --interface "$1" -H 'accept: application/dns-json' "$(vg_doh_url "$r" "$2" "$t")" 2>/dev/null |
-              /usr/bin/jq -r "$VG_DOH_JQ" 2>/dev/null
+              vg_jq -r "$VG_DOH_JQ" 2>/dev/null
           done | while read -r a; do if vg_is_ipv4 "$a" || vg_is_ipv6 "$a"; then echo "$a"; fi; done | sort -u | paste -sd' ' -)
     if [ -n "$out" ]; then echo "$out"; return 0; fi
   done

@@ -12,7 +12,10 @@ cp "$DIR/pf/vpnguard.rules" "$SIM/base/"
 echo 'dummy srs' > "$SIM/karing-ru.srs"
 SRS_SHA=$(shasum -a 256 "$SIM/karing-ru.srs" | awk '{print $1}')
 printf '# тест\n# sha256 источника: %s\n2.56.0.0/14\n5.255.255.0/24\n' "$SRS_SHA" > "$SIM/base/ru.cidr"
-sed -e "s|^VG_ADDR_TTL=43200|VG_ADDR_TTL=5|" "$DIR/lib/state.sh" > "$SIM/base/state.sh"
+# jq: встроенный (macOS 15+), иначе bin/jq из исходников (macOS 14: ./tools/get-jq.sh)
+JQ=/usr/bin/jq; [ -x "$JQ" ] || JQ="$DIR/bin/jq"
+[ -x "$JQ" ] || { echo "FAIL нет jq: в macOS 14 он не встроен — ./tools/get-jq.sh"; exit 1; }
+sed -e "s|^VG_ADDR_TTL=43200|VG_ADDR_TTL=5|" -e "s|^VG_JQ_LOCAL=.*|VG_JQ_LOCAL=\"$DIR/bin/jq\"|" "$DIR/lib/state.sh" > "$SIM/base/state.sh"
 sed -e "s|^VG_PROVIDER_RU_SRC=.*|VG_PROVIDER_RU_SRC=\"$SIM/karing-ru.srs\"|" "$DIR/providers/karing/provider.sh" > "$SIM/base/provider.sh"
 KCONF="$SIM/home/Library/Group Containers/group.com.nebula.karing/service_core.json"
 cp "$DIR/tests/fixtures/karing-service_core.json" "$KCONF"
@@ -297,7 +300,7 @@ expect 3 "13.1 сторож включил защиту" anchor_loaded
 [ "$(sk boot)" = BOOT-BBBB ] && ok "13.2 состояние переписано текущей загрузкой" || bad "13.2 boot=$(sk boot)"
 
 echo "== 14. Новый сервер в профиле Karing"
-jq '.outbounds += [{"type":"vless","tag":"n","server":"new.example","server_port":443}]' "$KCONF" > "$KCONF.t" && mv "$KCONF.t" "$KCONF"
+"$JQ" '.outbounds += [{"type":"vless","tag":"n","server":"new.example","server_port":443}]' "$KCONF" > "$KCONF.t" && mv "$KCONF.t" "$KCONF"
 echo "203.0.113.5" > "$SIM/dns/new.example"
 client_sync -q
 expect 5 "14.1 новый сервер в таблице" tbl_has vg_servers 203.0.113.5
@@ -313,7 +316,7 @@ expect 9 "15.4 через срок жизни прежний адрес убра
 
 echo "== 15a. Подмена резолвера и DNS по имени через настройки Karing не работает"
 : > "$SIM/doh.calls"
-jq '.dns.servers += [{"type":"udp","tag":"evil","server":"203.0.113.53"},{"type":"https","tag":"evil2","server":"api.anthropic.com"}]' "$KCONF" > "$KCONF.t" && mv "$KCONF.t" "$KCONF"
+"$JQ" '.dns.servers += [{"type":"udp","tag":"evil","server":"203.0.113.53"},{"type":"https","tag":"evil2","server":"api.anthropic.com"}]' "$KCONF" > "$KCONF.t" && mv "$KCONF.t" "$KCONF"
 echo "160.79.104.10" > "$SIM/dns/api.anthropic.com"
 client_sync -q
 expect 4 "15a.1 DNS-адрес из настроек — в таблице, с уведомлением" in_events "добавлен DNS-сервер 203.0.113.53"
@@ -321,11 +324,11 @@ sleep 2
 [ -z "$(awk '$1 != "1.1.1.1" && $1 != "8.8.8.8"' "$SIM/doh.calls")" ] && ok "15a.2 к подложенному резолверу сторож не ходит" || bad "15a.2 doh: $(sort -u "$SIM/doh.calls" | head -3)"
 tbl_has vg_dns 160.79.104.10 || tbl_has vg_servers 160.79.104.10 && bad "15a.3 DNS по имени не открыл адрес AI-сервиса" || ok "15a.3 DNS по имени не открыл адрес AI-сервиса"
 in_log "DNS-серверы Karing по имени не беру" && ok "15a.4 в журнале — пропущенный DNS по имени" || bad "15a.4 журнал"
-jq '.dns.servers |= map(select(.tag != "evil" and .tag != "evil2"))' "$KCONF" > "$KCONF.t" && mv "$KCONF.t" "$KCONF"
+"$JQ" '.dns.servers |= map(select(.tag != "evil" and .tag != "evil2"))' "$KCONF" > "$KCONF.t" && mv "$KCONF.t" "$KCONF"
 client_sync -q
 
 echo "== 16. Мусор и подлог в настройках Karing не проходят"
-jq '.outbounds += [{"type":"vless","server":"0.0.0.0/0"},{"type":"vless","server":"x.ru\nserver 160.79.104.10"},{"type":"vless","server":"a b.ru"}]' "$KCONF" > "$KCONF.t" && mv "$KCONF.t" "$KCONF"
+"$JQ" '.outbounds += [{"type":"vless","server":"0.0.0.0/0"},{"type":"vless","server":"x.ru\nserver 160.79.104.10"},{"type":"vless","server":"a b.ru"}]' "$KCONF" > "$KCONF.t" && mv "$KCONF.t" "$KCONF"
 client_sync -q
 expect 4 "16.1 в журнале — пропущенные странные адреса" in_log "пропустил странные адреса"
 sleep 1

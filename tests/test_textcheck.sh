@@ -148,6 +148,68 @@ for c in "/dev/null $T/rb" "$T/ra $T/rb" "$T/rb $T/ra" "$T/ra $T/rc"; do
     PASSN=$((PASSN + 1)); else FAILN=$((FAILN + 1)); echo "FAIL ru_diff обрывается под set -euo pipefail: $c"; fi
 done
 
+# Блок jq из install.sh (macOS 14: своя копия jq вместо встроенного) под set -euo pipefail, как в установщике.
+# Встроенный /usr/bin/jq в песочнице подменён: несуществующим путём (macOS 14) или исполняемой заглушкой
+# (macOS 15). sudo -u и curl — функции-заглушки: curl отдаёт заданный файл или «нет сети» и записывает,
+# с какими аргументами его звали. jq поддельный: блок только сверяет sha256 и ничего не исполняет.
+jq_block() { awk '/^# jq\. В macOS 15/{f=1} f{print} f && /^fi$/{exit}' "$DIR/install.sh" | sed "s|/usr/bin/jq|$1|g"; }
+jq_block "$T/nojq" > "$T/jq14.sh"
+printf '#!/bin/sh\n' > "$T/sysjq"; chmod +x "$T/sysjq"; jq_block "$T/sysjq" > "$T/jq15.sh"
+if [ -s "$T/jq14.sh" ] && grep -q 'JQ_NEED=1' "$T/jq14.sh"; then PASSN=$((PASSN + 1))
+else FAILN=$((FAILN + 1)); echo "FAIL не нашёл блок jq в install.sh"; fi
+if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then JA=jq-macos-arm64; JO=jq-macos-amd64; else JA=jq-macos-amd64; JO=jq-macos-arm64; fi
+JQF="$T/jqf"; mkdir -p "$JQF"
+printf 'jq для этого процессора\n' > "$JQF/good"; printf 'jq для другого\n' > "$JQF/other"; printf 'подделка\n' > "$JQF/bad"
+jsha() { shasum -a 256 "$1" | awk '{print $1}'; }
+JVER='# Официальные сборки jq 9.9.9: https://github.com/jqlang/jq/releases/tag/jq-9.9.9'
+JURL="https://github.com/jqlang/jq/releases/download/jq-9.9.9/$JA"
+printf '%s\n%s  %s\n%s  %s\n' "$JVER" "$(jsha "$JQF/good")" "$JA" "$(jsha "$JQF/other")" "$JO" > "$JQF/list"
+printf '%s\n%s  %s\n' "$JVER" "$(jsha "$JQF/other")" "$JO" > "$JQF/list-noarch"
+printf '%s\n%s  %s\n' "$JVER" "$(jsha "$JQF/good" | cut -c1-63)" "$JA" > "$JQF/list-short"
+printf '%s  %s\n' "$(jsha "$JQF/good")" "$JA" > "$JQF/list-nover"
+jq_case() { # ожидание(pass|refuse) описание блок jq-в-исходниках копия-root список сеть(none|good|bad|other|fail) [строка-в-выводе]
+  local want=$1 what=$2 block=$3 src=$4 base=$5 list=$6 net=$7 also=${8:-} r="$T/jqrun" out got=refuse calls
+  rm -rf "$r"; mkdir -p "$r/S/tools" "$r/SRC" "$r/BASE"
+  cp "$list" "$r/S/tools/jq.sha256"
+  if [ -n "$src" ]; then mkdir -p "$r/SRC/bin"; cp "$src" "$r/SRC/bin/jq"; fi
+  if [ -n "$base" ]; then mkdir -p "$r/BASE/bin"; cp "$base" "$r/BASE/bin/jq"; fi
+  out=$(S="$r/S" SRC="$r/SRC" BASE="$r/BASE" U=nobody R="$r" NET="$net" JQF="$JQF" bash -c '
+    set -euo pipefail
+    sudo() { shift 2; "$@"; }
+    curl() { printf "%s\n" "$*" >> "$R/curl.calls"
+             case $NET in good|bad|other) cat "$JQF/$NET" ;; *) return 7 ;; esac; }
+    . "$1"; echo "OK need=$JQ_NEED"' _ "$block" 2>&1)
+  case $out in
+    *"OK need=1"*) if [ -x "$r/S/bin/jq" ] && cmp -s "$r/S/bin/jq" "$JQF/good"; then got=pass; else got="pass, но в копии не тот файл"; fi ;;
+    *"OK need=0"*) if [ ! -e "$r/S/bin" ]; then got=pass; else got="pass, но что-то положено в bin/"; fi ;;
+  esac
+  # в сеть — только когда нужно, один раз, без ~/.curlrc (-q первым), только https, по адресу из списка
+  calls=$(cat "$r/curl.calls" 2>/dev/null)
+  if [ "$net" = none ]; then [ -z "$calls" ] || got="$got, но ходил в сеть"
+  else
+    case $calls in "-q "*) ;; *) got="$got, но curl без -q первым: $calls" ;; esac
+    case $calls in *" --proto =https "*) ;; *) got="$got, но curl без --proto =https: $calls" ;; esac
+    case $calls in *" $JURL") ;; *) got="$got, но curl не по адресу из списка: $calls" ;; esac
+    [ "$(printf '%s\n' "$calls" | grep -c .)" = 1 ] || got="$got, но curl звали не один раз"
+  fi
+  if [ "$got" = "$want" ] && { [ -z "$also" ] || [[ $out == *"$also"* ]]; }; then PASSN=$((PASSN + 1))
+  else FAILN=$((FAILN + 1)); echo "FAIL jq в установщике: $what — ждали $want${also:+ и «${also}»}, получили $got: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"; fi
+}
+jq_case pass   "свой jq из исходников"                                "$T/jq14.sh" "$JQF/good"  ""           "$JQF/list" none  "ставлю $T/jqrun/SRC/bin/jq"
+jq_case pass   "в исходниках нет — прежняя копия root"                "$T/jq14.sh" ""           "$JQF/good"  "$JQF/list" none  "(уже стоит)"
+jq_case pass   "нигде нет — скачивает"                                "$T/jq14.sh" ""           ""           "$JQF/list" good  "скачиваю $JURL"
+jq_case pass   "подделка в исходниках — не берёт, ставит копию root"  "$T/jq14.sh" "$JQF/bad"   "$JQF/good"  "$JQF/list" none  "ВНИМАНИЕ"
+jq_case pass   "подделка в исходниках, копии root нет — скачивает"    "$T/jq14.sh" "$JQF/bad"   ""           "$JQF/list" good  "ВНИМАНИЕ"
+jq_case pass   "в исходниках сборка под другой процессор — скачивает" "$T/jq14.sh" "$JQF/other" ""           "$JQF/list" good  "ВНИМАНИЕ"
+jq_case pass   "копия root не из списка (сменилась версия) — скачивает" "$T/jq14.sh" ""         "$JQF/bad"   "$JQF/list" good  "скачиваю"
+jq_case refuse "скачалось не то"                                      "$T/jq14.sh" ""           ""           "$JQF/list" bad   "Отказ: скачанный"
+jq_case refuse "скачалась сборка под другой процессор"                "$T/jq14.sh" ""           ""           "$JQF/list" other "Отказ: скачанный"
+jq_case refuse "нет интернета — подсказка про get-jq.sh"              "$T/jq14.sh" ""           ""           "$JQF/list" fail  "tools/get-jq.sh"
+jq_case refuse "в списке нет версии — не знает, что качать"           "$T/jq14.sh" ""           ""           "$JQF/list-nover" none "нет строки с версией"
+jq_case refuse "в списке нет суммы для этого процессора"              "$T/jq14.sh" "$JQF/good"  ""           "$JQF/list-noarch" none "нет суммы"
+jq_case refuse "сумма не из 64 знаков — не сумма"                     "$T/jq14.sh" "$JQF/good"  ""           "$JQF/list-short" none "нет суммы"
+jq_case pass   "встроенный jq есть (macOS 15) — не ставит и не качает" "$T/jq15.sh" "$JQF/good" ""           "$JQF/list" none  "OK need=0"
+
 # $имя сразу перед не-ASCII символом: bash 3.2 в UTF-8 считает байты «»/кириллицы частью имени →
 # «unbound variable» и падение под set -u (так падал сторож на «$v»). Только ${имя}.
 SH=""; for f in $FILES; do case $f in *.sh|daemon/*|cli/*|lib/*) SH="$SH $DIR/$f" ;; esac; done
