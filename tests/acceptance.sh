@@ -130,6 +130,14 @@ fi
 
 echo
 echo "== 4. Сторож чинит"
+# ПОЧИНКУ сторож пишет в журнал после перепроверки загруженного набора, то есть позже, чем правила видны
+# в pf (4.1). Поэтому 4.3 ждёт запись не раньше начала этого раздела: без 4.2 (pf был включён до установки)
+# разовая проверка сразу после 4.1 опережала журнал. Смотрим и .1: журнал мог смениться на 1 МБ
+T4=$(date '+%Y-%m-%d %H:%M:%S')
+repair_logged() {
+  cat /Library/Logs/VPNGuard.log.1 /Library/Logs/VPNGuard.log 2>/dev/null |
+    awk -v t="$T4" 'substr($0, 1, 19) >= t && /ПОЧИНКА/ { f = 1 } END { exit !f }'
+}
 pfctl -a "$VG_ANCHOR" -F rules >/dev/null 2>&1
 wait_for 5 "4.1 правила вернулись после сноса"                rules_loaded
 if [ "$PF_BEFORE" = Disabled ]; then
@@ -139,7 +147,7 @@ if [ "$PF_BEFORE" = Disabled ]; then
 else
   echo "     4.2 пропущен: до установки pf был включён кем-то ещё — pfctl -d сломал бы чужие ссылки"
 fi
-probe root "4.3 в журнале есть ПОЧИНКА"                         ok    grep -c "ПОЧИНКА" /Library/Logs/VPNGuard.log
+wait_for 5 "4.3 в журнале есть ПОЧИНКА"                         repair_logged
 pfctl -a "$VG_ANCHOR" -F Tables >/dev/null 2>&1
 wait_for 5 "4.4 таблицы адресов вернулись после сноса"         tables_full
 
