@@ -3,6 +3,9 @@
 set -u
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$DIR/lib/state.sh"
+# macOS 14: встроенного jq нет — берём bin/jq из исходников (tools/get-jq.sh; при установке — копия в
+# каталоге root, сверенная установщиком). Встроенный /usr/bin/jq vg_jq всё равно предпочтёт.
+[ -x "$DIR/bin/jq" ] && VG_JQ_LOCAL="$DIR/bin/jq"
 PASSN=0; FAILN=0
 eq() { # label expected actual
   if [ "$2" = "$3" ]; then PASSN=$((PASSN+1))
@@ -154,9 +157,23 @@ fi
 eq "doh url cloudflare" "https://1.1.1.1/dns-query?name=a.ru&type=A" "$(vg_doh_url 1.1.1.1 a.ru A)"
 eq "doh url google" "https://8.8.8.8/resolve?name=a.ru&type=AAAA" "$(vg_doh_url 8.8.8.8 a.ru AAAA)"
 J='{"Status":0,"Answer":[{"name":"a.ru","type":5,"data":"b.ru."},{"name":"b.ru","type":1,"data":"203.0.113.20"},{"type":28,"data":"2001:db8::5"},{"type":16,"data":"txt"}]}'
-eq "doh: A и AAAA, без CNAME/TXT" "203.0.113.20 2001:db8::5" "$(printf '%s' "$J" | /usr/bin/jq -r "$VG_DOH_JQ" | paste -sd' ' -)"
-eq "doh: NXDOMAIN — пусто" "" "$(printf '{"Status":3}' | /usr/bin/jq -r "$VG_DOH_JQ")"
-eq "doh: мусор — пусто" "" "$(printf 'oops' | /usr/bin/jq -r "$VG_DOH_JQ" 2>/dev/null)"
+eq "doh: A и AAAA, без CNAME/TXT" "203.0.113.20 2001:db8::5" "$(printf '%s' "$J" | vg_jq -r "$VG_DOH_JQ" | paste -sd' ' -)"
+eq "doh: NXDOMAIN — пусто" "" "$(printf '{"Status":3}' | vg_jq -r "$VG_DOH_JQ")"
+eq "doh: мусор — пусто" "" "$(printf 'oops' | vg_jq -r "$VG_DOH_JQ" 2>/dev/null)"
+
+# jq: есть встроенный или bin/jq (macOS 14: ./tools/get-jq.sh); список сумм для установщика — строгий.
+# Обновление с версии без tools/jq.sha256 идёт прежней копией установщика, а она этот файл не копирует:
+# тогда проверки списка пропускаем (как блок Karing при другом адаптере)
+eq "jq запускается (macOS 14 — ./tools/get-jq.sh)" 0 "$(rc vg_jq --version)"
+JL="$DIR/tools/jq.sha256"
+if [ -f "$JL" ]; then
+  eq "jq.sha256: строки — комментарий или «sha256  jq-macos-amd64|arm64»" "" "$(grep -v -e '^#' -e '^$' "$JL" | grep -v -E '^[0-9a-f]{64}  jq-macos-(amd64|arm64)$')"
+  eq "jq.sha256: по сумме на каждый процессор" "jq-macos-amd64 jq-macos-arm64" "$(grep -v '^#' "$JL" | awk 'NF {print $2}' | sort -u | paste -sd' ' -)"
+  eq "jq.sha256: версия для tools/get-jq.sh" 1 "$(grep -c -E '^# Официальные сборки jq [0-9.]+: https://github\.com/jqlang/jq/releases/tag/jq-[0-9.]+$' "$JL")"
+  if [ -f "$DIR/bin/jq" ]; then
+    eq "bin/jq — из списка jq.sha256" 1 "$(h=$(shasum -a 256 "$DIR/bin/jq" | awk '{print $1}'); grep -c "^$h " "$JL")"
+  fi
+fi
 N=$'Internet:\nDestination        Gateway            Flags               Netif Expire\ndefault            link#24            UCSg                utun6\ndefault            192.168.1.1        UGScIg                en0\n'
 eq "физический интерфейс — не туннель" en0 "$(printf '%s' "$N" | vg_phys_iface)"
 eq "только туннель — пусто" "" "$(printf 'default link#24 UCSg utun6\n' | vg_phys_iface)"

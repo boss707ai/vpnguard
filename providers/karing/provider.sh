@@ -17,6 +17,7 @@ VG_PROVIDER_PROXY_DIRECT="127.0.0.1:3065"
 VG_PROVIDER_NC_MATCH="com.nebula.karing"
 
 # Фильтр jq: конфиг sing-box от Karing → «server АДРЕС», «dns ТИП АДРЕС», «bad <значение в JSON>».
+# jq вызывается через vg_jq (lib/state.sh): встроенный в macOS 15+, в macOS 14 — копия VPN Guard.
 # Серверы — все outbounds с полем server. DNS — только без detour (те, к которым ядро Karing ходит
 # напрямую) и сетевых типов; local/dhcp/hosts/batch — мимо. Строка с переводом строки или пробелом
 # становится «bad» в виде JSON и не может выдать себя за другую запись.
@@ -28,7 +29,7 @@ def cls($kind): if (type == "string") and test("^[A-Za-z0-9.:-]{1,253}$") then "
       | select(has("server")) | .type as $t | .server | cls("dns \($t)")) catch empty)'
 
 # vg_karing_extract ФАЙЛ → строки фильтра VG_KARING_JQ (не JSON или чужая структура → пусто)
-vg_karing_extract() { /usr/bin/jq -r "$VG_KARING_JQ" "$1" 2>/dev/null || true; }
+vg_karing_extract() { vg_jq -r "$VG_KARING_JQ" "$1" 2>/dev/null || true; }
 
 # vg_provider_extract → выжимка для сторожа. Запускается от пользователя, не от root: данные других
 # приложений macOS отдаёт только процессам пользователя с разрешением. Успех — строки «server АДРЕС»,
@@ -36,7 +37,7 @@ vg_karing_extract() { /usr/bin/jq -r "$VG_KARING_JQ" "$1" 2>/dev/null || true; }
 # «error КОД текст» и rc=1; КОД: denied (macOS не пускает), missing (нет конфига), unreadable.
 vg_provider_extract() {
   local conf="$HOME/$VG_PROVIDER_CONF" out
-  if out=$(/usr/bin/jq -r "$VG_KARING_JQ" "$conf" 2>&1); then printf '%s\n' "$out"; return 0; fi
+  if out=$(vg_jq -r "$VG_KARING_JQ" "$conf" 2>&1); then printf '%s\n' "$out"; return 0; fi
   if [[ $out == *"not permitted"* ]]; then echo "error denied macOS не пускает к настройкам Karing ($conf) — разреши доступ (памятка)"
   elif [ ! -e "$conf" ]; then echo "error missing нет файла настроек Karing: $conf"
   else echo "error unreadable не прочитал настройки Karing: ${out:0:120}"; fi
@@ -70,8 +71,8 @@ vg_provider_precheck() {
 
   # Напрямую мимо туннеля защита пускает только в российские IP (тот же список geoip:ru, что у Karing).
   # Остальные «прямые» правила Karing под защитой не откроются: сайт будет недоступен.
-  geosite=$(/usr/bin/jq -r '[.route.rules[]? | select(.outbound == "direct_out") | .rule_set[]? | select(startswith("geosite:"))] | unique | join(" ")' "$conf" 2>/dev/null)
-  geoip=$(/usr/bin/jq -r '[.route.rules[]? | select(.outbound == "direct_out") | .rule_set[]? | select(startswith("geoip:") and . != "geoip:ru")] | unique | join(" ")' "$conf" 2>/dev/null)
+  geosite=$(vg_jq -r '[.route.rules[]? | select(.outbound == "direct_out") | .rule_set[]? | select(startswith("geosite:"))] | unique | join(" ")' "$conf" 2>/dev/null)
+  geoip=$(vg_jq -r '[.route.rules[]? | select(.outbound == "direct_out") | .rule_set[]? | select(startswith("geoip:") and . != "geoip:ru")] | unique | join(" ")' "$conf" 2>/dev/null)
   if [ -n "$geosite" ]; then
     warn "в Karing включены прямые правила по доменам ($geosite). Выключи «по доменам» (geosite) в «Автоматически добавлять основные правила», по IP (geoip) оставь, и переподключи Karing. Или запусти providers/karing/geosite-off.sh — сделает это сам, с копией настроек"
   else ok "прямых правил по доменам (geosite) в Karing нет"; fi

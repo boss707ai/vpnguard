@@ -13,11 +13,16 @@ G="${VG_KARING_DIR:-$HOME/Library/Group Containers/group.com.nebula.karing}"   #
 F="$G/karing_setting.json"
 SC="$G/service_core.json"
 say() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
+# jq: встроенный (macOS 15+), иначе копия VPN Guard, иначе bin/jq из исходников (tools/get-jq.sh)
+JQ=/usr/bin/jq
+[ -x "$JQ" ] || JQ="/Library/Application Support/VPNGuard/bin/jq"
+[ -x "$JQ" ] || JQ="$(cd "$(dirname "$0")/../.." && pwd)/bin/jq"
+[ -x "$JQ" ] || { say "нет jq: в macOS 14 он не встроен — скачай его без sudo: ./tools/get-jq.sh"; exit 1; }
 
 [ -r "$F" ] || { say "не прочитал $F (Karing не стоит или macOS не даёт доступ Терминалу)"; exit 1; }
-cur=$(/usr/bin/jq -r '.rule_sets.auto_append_region_geosite' "$F" 2>/dev/null)
+cur=$("$JQ" -r '.rule_sets.auto_append_region_geosite' "$F" 2>/dev/null)
 case $cur in
-  false) say "уже выключено: по доменам (geosite) — нет, по IP (geoip) — $(/usr/bin/jq -r '.rule_sets.auto_append_region_geoip' "$F")"; exit 0 ;;
+  false) say "уже выключено: по доменам (geosite) — нет, по IP (geoip) — $("$JQ" -r '.rule_sets.auto_append_region_geoip' "$F")"; exit 0 ;;
   true)  ;;
   *)     say "в настройках этой версии Karing нет rule_sets.auto_append_region_geosite — выключи вручную"; exit 1 ;;
 esac
@@ -25,7 +30,7 @@ esac
 edit() { # файл → правленая копия; rc 0 — правка ровно одна и только в этом ключе
   sed -E 's/"auto_append_region_geosite"( *): *true/"auto_append_region_geosite"\1: false/' "$1" > "$2" || return 1
   [ "$(diff "$1" "$2" | grep -c '^[<>]')" = 2 ] || return 1
-  [ "$(/usr/bin/jq -n --slurpfile a "$1" --slurpfile b "$2" '
+  [ "$("$JQ" -n --slurpfile a "$1" --slurpfile b "$2" '
     ($b[0].rule_sets.auto_append_region_geosite == false) and
     (($a[0] | del(.rule_sets.auto_append_region_geosite)) == ($b[0] | del(.rule_sets.auto_append_region_geosite)))')" = true ]
 }
@@ -34,7 +39,7 @@ trap 'rm -f "$T"' EXIT
 edit "$F" "$T" || { say "правка не прошла проверку — ничего не трогаю"; exit 1; }
 VPN=$(scutil --nc list 2>/dev/null | sed -n 's/.*"\([^"]*\)" *\[VPN:com\.nebula\.karing\].*/\1/p' | head -1)
 if [ "${1:-}" = --check ]; then
-  say "будет: rule_sets.auto_append_region_geosite true → false (geoip остаётся $(/usr/bin/jq -r '.rule_sets.auto_append_region_geoip' "$F"))"
+  say "будет: rule_sets.auto_append_region_geosite true → false (geoip остаётся $("$JQ" -r '.rule_sets.auto_append_region_geoip' "$F"))"
   say "Karing закроется и запустится снова; VPN в системе: ${VPN:-не найден}"
   exit 0
 fi
@@ -59,7 +64,7 @@ if [ -n "$VPN" ] && ! scutil --nc status "$VPN" 2>/dev/null | head -1 | grep -qx
 fi
 
 # 4. правка (заново — Karing мог переписать файл при выходе)
-if edit "$F" "$T"; then cat "$T" > "$F"; say "правка внесена: по доменам (geosite) выключено, по IP (geoip) — $(/usr/bin/jq -r '.rule_sets.auto_append_region_geoip' "$F")"
+if edit "$F" "$T"; then cat "$T" > "$F"; say "правка внесена: по доменам (geosite) выключено, по IP (geoip) — $("$JQ" -r '.rule_sets.auto_append_region_geoip' "$F")"
 else say "после выхода Karing правка не прошла проверку — файл не трогаю"; fi
 
 # 5. Karing запустить и дождаться подключения
@@ -71,6 +76,6 @@ for i in $(seq 1 90); do
 done
 if [ -n "$VPN" ] && scutil --nc status "$VPN" 2>/dev/null | head -1 | grep -qx Connected; then say "Karing подключён"
 else say "Karing пока не подключён — подключи его в окне Karing"; fi
-left=$(/usr/bin/jq -r '[.route.rules[]? | select(.outbound == "direct_out") | .rule_set[]? | select(startswith("geosite:"))] | join(" ")' "$SC" 2>/dev/null)
+left=$("$JQ" -r '[.route.rules[]? | select(.outbound == "direct_out") | .rule_set[]? | select(startswith("geosite:"))] | join(" ")' "$SC" 2>/dev/null)
 if [ -z "$left" ]; then say "в рабочем конфиге Karing прямых правил по доменам больше нет"
 else say "в рабочем конфиге Karing ещё есть: $left — переподключи Karing"; fi
